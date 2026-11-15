@@ -2964,6 +2964,30 @@ impl dispatch::QueueInterface for WebQueue {
         data: &[u8],
     ) {
         let buffer = buffer.as_webgpu();
+
+        // Give the browser a view of the bytes where they are in the wasm
+        // memory, rather than a copy of them in a new `ArrayBuffer`:
+        // `writeBuffer` copies the data itself before it returns.
+        //
+        // SAFETY: the view is only used by the call below, which is
+        // synchronous, so the wasm memory cannot grow while the view exists.
+        let view = unsafe { js_sys::Uint8Array::view(data) };
+        if self
+            .inner
+            .write_buffer_with_f64_and_u8_array_and_f64_and_f64(
+                &buffer.inner,
+                offset as f64,
+                &view,
+                0f64,
+                data.len() as f64,
+            )
+            .is_ok()
+        {
+            return;
+        }
+
+        // The browser refused the view, which some do when the wasm memory is
+        // shared. Copy the data instead.
         self.inner
             .write_buffer_with_f64_and_u8_slice_and_f64_and_f64(
                 &buffer.inner,
@@ -3050,12 +3074,35 @@ impl dispatch::QueueInterface for WebQueue {
         }
         mapped_data_layout.set_offset_f64(data_layout.offset as f64);
 
+        let destination = map_texture_copy_view(texture);
+        let extent = map_extent_3d(size);
+
+        // As in `write_buffer`, give the browser a view of the wasm memory
+        // rather than a copy.
+        //
+        // SAFETY: the view is only used by the call below, which is
+        // synchronous, so the wasm memory cannot grow while the view exists.
+        let view = unsafe { js_sys::Uint8Array::view(data) };
+        if self
+            .inner
+            .write_texture_with_u8_array_and_gpu_extent_3d_dict(
+                &destination,
+                &view,
+                &mapped_data_layout,
+                &extent,
+            )
+            .is_ok()
+        {
+            return;
+        }
+
+        // The browser refused the view: copy the data instead.
         self.inner
             .write_texture_with_u8_slice_and_gpu_extent_3d_dict(
-                &map_texture_copy_view(texture),
+                &destination,
                 data,
                 &mapped_data_layout,
-                &map_extent_3d(size),
+                &extent,
             )
             .unwrap();
     }

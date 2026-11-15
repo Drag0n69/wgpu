@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>wgpu WebGPU resource lifetime repro</title>
+  </head>
+  <body>
+    <pre id="result">running…</pre>
+    <script type="module">
+      // Count what wgpu asks the browser for, before wgpu is loaded.
+      const stats = {
+        buffers: { created: 0, destroyed: 0, bytesCreated: 0, bytesNotDestroyed: 0 },
+        textures: { created: 0, destroyed: 0, bytesCreated: 0, bytesNotDestroyed: 0 },
+        arrayBuffersFromWrites: 0,
+      };
+      const sizes = new WeakMap();
+      function track(kind, object, bytes) {
+        stats[kind].created += 1;
+        stats[kind].bytesCreated += bytes;
+        stats[kind].bytesNotDestroyed += bytes;
+        sizes.set(object, bytes);
+        return object;
+      }
+      function untrack(kind, object) {
+        if (sizes.has(object)) {
+          stats[kind].destroyed += 1;
+          stats[kind].bytesNotDestroyed -= sizes.get(object);
+          sizes.delete(object);
+        }
+      }
+      if (globalThis.GPUDevice) {
+        const createBuffer = GPUDevice.prototype.createBuffer;
+        GPUDevice.prototype.createBuffer = function (descriptor) {
+          return track("buffers", createBuffer.call(this, descriptor), descriptor.size);
+        };
+        const destroyBuffer = GPUBuffer.prototype.destroy;
+        GPUBuffer.prototype.destroy = function () {
+          untrack("buffers", this);
+          return destroyBuffer.call(this);
+        };
+        const createTexture = GPUDevice.prototype.createTexture;
+        GPUDevice.prototype.createTexture = function (descriptor) {
+          const size = descriptor.size;
+          const [width, height = 1, layers = 1] = Array.isArray(size)
+            ? size
+            : [size.width, size.height, size.depthOrArrayLayers];
+          // Every texture of this repro is RGBA8 without mips.
+          return track("textures", createTexture.call(this, descriptor), width * height * layers * 4);
+        };
+        const destroyTexture = GPUTexture.prototype.destroy;
+        GPUTexture.prototype.destroy = function () {
+          untrack("textures", this);
+          return destroyTexture.call(this);
+        };
+        // Is the data given to the queue a view of the wasm memory, or a copy
+        // in an `ArrayBuffer` of its own?
+        const isCopy = (data) =>
+          ArrayBuffer.isView(data) && data.buffer.byteLength === data.byteLength;
+        const writeBuffer = GPUQueue.prototype.writeBuffer;
+        GPUQueue.prototype.writeBuffer = function (buffer, offset, data, ...rest) {
+          if (isCopy(data)) stats.arrayBuffersFromWrites += 1;
+          return writeBuffer.call(this, buffer, offset, data, ...rest);
+        };
+        const writeTexture = GPUQueue.prototype.writeTexture;
+        GPUQueue.prototype.writeTexture = function (destination, data, ...rest) {
+          if (isCopy(data)) stats.arrayBuffersFromWrites += 1;
+          return writeTexture.call(this, destination, data, ...rest);
+        };
+      }
+
+      const snapshot = () => JSON.parse(JSON.stringify(stats));
+      const delta = (after, before) => ({
+        buffersCreated: after.buffers.created - before.buffers.created,
+        buffersDestroyed: after.buffers.destroyed - before.buffers.destroyed,
+        texturesCreated: after.textures.created - before.textures.created,
+        texturesDestroyed: after.textures.destroyed - before.textures.destroyed,
+      });
+      const mib = (bytes) => Math.round((bytes / (1024 * 1024)) * 10) / 10;
+      const median = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+
+      async function run() {
+        const result = { userAgent: navigator.userAgent };
+        if (!navigator.gpu) throw new Error("navigator.gpu is not available");
+        const { default: load, ...repro } = await import("./repro.js");
+        await load();
+        result.adapter = await repro.init();
+
+        // 1. A scratch buffer per frame.
+        let before = snapshot();
+        repro.churn_buffers(1000, 256 * 1024);
+        repro.submit_empty(2);
+        let after = snapshot();
+        result.churnBuffers = {
+          ...delta(after, before),
+          mibCreated: mib(after.buffers.bytesCreated - before.buffers.bytesCreated),
+          mibLeftToGarbageCollector: mib(
+            after.buffers.bytesNotDestroyed - before.buffers.bytesNotDestroyed,
+          ),
+        };
+
+        // 2. A scratch texture per frame.
+        before = snapshot();
+        repro.churn_textures(200, 512);
+        repro.submit_empty(2);
+        after = snapshot();
+        result.churnTextures = {
+          ...delta(after, before),
+          mibCreated: mib(after.textures.bytesCreated - before.textures.bytesCreated),
+          mibLeftToGarbageCollector: mib(
+            after.textures.bytesNotDestroyed - before.textures.bytesNotDestroyed,
+          ),
+        };
+
+        // 3. A bind group keeps the resources it binds alive.
+        before = snapshot();
+        const validationError = await repro.use_bind_group_after_dropping_its_resources(5);
+        const whileBound = delta(snapshot(), before);
+        repro.drop_bind_group();
+        repro.submit_empty(2);
+        const afterDrop = delta(snapshot(), before);
+        result.bindGroup = {
+          validationError,
+          destroyedWhileBound: whileBound.buffersDestroyed + whileBound.texturesDestroyed,
+          destroyedAfterBindGroupDropped: afterDrop.buffersDestroyed + afterDrop.texturesDestroyed,
+        };
+
+        // 4. Time spent on the calling thread by queue writes.
+        const writes = snapshot().arrayBuffersFromWrites;
+        const bufferTimes = [];
+        const textureTimes = [];
+        for (let round = 0; round < 5; round++) {
+          let start = performance.now();
+          repro.write_buffer_repeatedly(20, 16 * 1024 * 1024);
+          bufferTimes.push(performance.now() - start);
+          start = performance.now();
+          repro.write_texture_repeatedly(20, 2048);
+          textureTimes.push(performance.now() - start);
+        }
+        result.queueWrites = {
+          writeBuffer16MibMs: Math.round((median(bufferTimes) / 20) * 100) / 100,
+          writeTexture2048Ms: Math.round((median(textureTimes) / 20) * 100) / 100,
+          writesGivenACopy: snapshot().arrayBuffersFromWrites - writes,
+          writesTotal: 5 * 20 * 2,
+        };
+        return result;
+      }
+
+      let result;
+      try {
+        result = await run();
+      } catch (error) {
+        result = { error: String(error && error.stack ? error.stack : error) };
+      }
+      const text = JSON.stringify(result, null, 2);
+      document.getElementById("result").textContent = text;
+      try {
+        await fetch("/result", { method: "POST", body: text });
+      } catch {
+        // Opened by hand, without `run.mjs`.
+      }
+    </script>
+  </body>
+</html>

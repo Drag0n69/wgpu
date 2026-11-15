@@ -1043,6 +1043,8 @@ fn future_request_device(
 
             (
                 WebDevice {
+                    features: map_wgt_features(device.features()),
+                    limits: map_wgt_limits(device.limits()),
                     inner: device,
                     ident: crate::cmp::Identifier::create(),
                     error_scope_count: Rc::new(Cell::new(0)),
@@ -1272,6 +1274,9 @@ pub struct WebDevice {
     ident: crate::cmp::Identifier,
     /// Current number of error scopes that have been pushed on the device.
     error_scope_count: Rc<Cell<u32>>,
+    // GripForge: fixed device capabilities, cached once.
+    features: wgt::Features,
+    limits: wgt::Limits,
 }
 
 #[derive(Debug, Clone)]
@@ -1884,11 +1889,11 @@ impl WebDevice {
 
 impl dispatch::DeviceInterface for WebDevice {
     fn features(&self) -> crate::Features {
-        map_wgt_features(self.inner.features())
+        self.features
     }
 
     fn limits(&self) -> crate::Limits {
-        map_wgt_limits(self.inner.limits())
+        self.limits.clone()
     }
 
     fn adapter_info(&self) -> crate::AdapterInfo {

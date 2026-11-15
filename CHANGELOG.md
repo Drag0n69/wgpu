@@ -405,6 +405,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 #### WebGPU
 
 - Cache adapter and device limits, features, and adapter info on the browser WebGPU backend, so repeated calls no longer re-read those JavaScript objects. By @apetrock in [#10513](https://github.com/gfx-rs/wgpu/pull/10513).
+- `Queue::write_buffer` and `Queue::write_texture` now always hand the browser a view of the data in the WebAssembly memory, including when that memory is shared, instead of a copy in a new `ArrayBuffer`. By @Drag0n69 in [#NNNNN](https://github.com/gfx-rs/wgpu/pull/NNNNN).
 
 #### Metal
 

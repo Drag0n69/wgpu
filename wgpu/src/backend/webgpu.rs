@@ -2,6 +2,7 @@
 
 mod defined_non_null_js_value;
 mod ext_bindings;
+mod gripforge_life; // GripForge (MOT-133): a buffer nothing uses any more is destroyed.
 #[allow(clippy::allow_attributes)]
 pub(crate) mod webgpu_sys;
 
@@ -1296,6 +1297,7 @@ pub struct WebBindGroupLayout {
 #[derive(Debug, Clone)]
 pub struct WebBindGroup {
     pub(crate) inner: webgpu_sys::GpuBindGroup,
+    _held: Vec<gripforge_life::Held>,
     /// Unique identifier for this BindGroup.
     ident: crate::cmp::Identifier,
 }
@@ -1303,6 +1305,7 @@ pub struct WebBindGroup {
 #[derive(Debug, Clone)]
 pub struct WebTextureView {
     pub(crate) inner: webgpu_sys::GpuTextureView,
+    life: Option<Rc<gripforge_life::TextureLife>>,
     /// Unique identifier for this TextureView.
     ident: crate::cmp::Identifier,
 }
@@ -1332,6 +1335,7 @@ struct WebBufferMapState {
 pub struct WebBuffer {
     /// The associated GPU buffer.
     pub(crate) inner: webgpu_sys::GpuBuffer,
+    life: Rc<gripforge_life::BufferLife>,
     /// The mapped array buffer and mapped range.
     mapping: Rc<RefCell<WebBufferMapState>>,
     /// Unique identifier for this Buffer.
@@ -1342,6 +1346,7 @@ impl WebBuffer {
     /// Creates a new web buffer for the given Javascript object and description.
     fn new(inner: webgpu_sys::GpuBuffer, desc: &crate::BufferDescriptor<'_>) -> Self {
         Self {
+            life: gripforge_life::BufferLife::new(&inner),
             inner,
             mapping: Rc::new(RefCell::new(WebBufferMapState {
                 mapped_buffer: None,
@@ -1396,6 +1401,7 @@ pub struct WebTexture {
     ///   this `WebTexture` is dropped, signalling that wgpu is done with the
     ///   handle.
     drop_guard: Option<Rc<DropGuard>>,
+    life: Option<Rc<gripforge_life::TextureLife>>,
     /// Unique identifier for this Texture.
     ident: crate::cmp::Identifier,
 }
@@ -1881,6 +1887,7 @@ impl WebDevice {
         WebTexture {
             inner: texture,
             drop_guard: Some(Rc::new(DropGuard::new(drop_callback))),
+            life: None,
             ident: crate::cmp::Identifier::create(),
         }
         .into()
@@ -2261,6 +2268,7 @@ impl dispatch::DeviceInterface for WebDevice {
 
         WebBindGroup {
             inner: bind_group,
+            _held: gripforge_life::of(desc),
             ident: crate::cmp::Identifier::create(),
         }
         .into()
@@ -2491,6 +2499,7 @@ impl dispatch::DeviceInterface for WebDevice {
 
         let texture = self.inner.create_texture(&mapped_desc).unwrap();
         WebTexture {
+            life: Some(gripforge_life::TextureLife::new(&texture)),
             inner: texture,
             drop_guard: None,
             ident: crate::cmp::Identifier::create(),
@@ -2869,7 +2878,7 @@ impl dispatch::QueueInterface for WebQueue {
             .collect::<Vec<webgpu_sys::GpuCommandBuffer>>();
 
         self.inner.submit(&array);
-
+        gripforge_life::submitted();
         0
     }
 
@@ -2935,18 +2944,8 @@ impl Drop for WebBindGroupLayout {
 }
 
 impl dispatch::BindGroupInterface for WebBindGroup {}
-impl Drop for WebBindGroup {
-    fn drop(&mut self) {
-        // no-op
-    }
-}
 
 impl dispatch::TextureViewInterface for WebTextureView {}
-impl Drop for WebTextureView {
-    fn drop(&mut self) {
-        // no-op
-    }
-}
 
 impl dispatch::SamplerInterface for WebSampler {}
 impl Drop for WebSampler {
@@ -2996,11 +2995,6 @@ impl dispatch::BufferInterface for WebBuffer {
         self.inner.destroy();
     }
 }
-impl Drop for WebBuffer {
-    fn drop(&mut self) {
-        // no-op
-    }
-}
 
 impl dispatch::TextureInterface for WebTexture {
     fn create_view(
@@ -3032,6 +3026,7 @@ impl dispatch::TextureInterface for WebTexture {
 
         WebTextureView {
             inner: view,
+            life: self.life.clone(),
             ident: crate::cmp::Identifier::create(),
         }
         .into()
@@ -3041,12 +3036,6 @@ impl dispatch::TextureInterface for WebTexture {
         if self.drop_guard.is_none() {
             self.inner.destroy();
         }
-    }
-}
-impl Drop for WebTexture {
-    fn drop(&mut self) {
-        // The drop callback for external textures is fired by `DropGuard`'s
-        // own `Drop` impl when the last `Rc<DropGuard>` clone is released.
     }
 }
 
@@ -4381,6 +4370,7 @@ impl dispatch::SurfaceInterface for WebSurface {
         let web_surface_texture = WebTexture {
             inner: surface_texture,
             drop_guard: None,
+            life: None,
             ident: crate::cmp::Identifier::create(),
         };
 

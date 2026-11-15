@@ -1,5 +1,6 @@
 #![allow(clippy::type_complexity)]
 
+mod deferred_destroy;
 mod defined_non_null_js_value;
 mod ext_bindings;
 #[allow(clippy::allow_attributes)]
@@ -1268,6 +1269,8 @@ pub struct WebBindGroupLayout {
 #[derive(Debug, Clone)]
 pub struct WebBindGroup {
     pub(crate) inner: webgpu_sys::GpuBindGroup,
+    /// Keeps the buffers and textures bound by this bind group alive.
+    _held: Vec<deferred_destroy::Held>,
     /// Unique identifier for this BindGroup.
     ident: crate::cmp::Identifier,
 }
@@ -1275,6 +1278,8 @@ pub struct WebBindGroup {
 #[derive(Debug, Clone)]
 pub struct WebTextureView {
     pub(crate) inner: webgpu_sys::GpuTextureView,
+    /// Keeps the texture this is a view of alive, if wgpu created it.
+    life: Option<Rc<deferred_destroy::TextureLife>>,
     /// Unique identifier for this TextureView.
     ident: crate::cmp::Identifier,
 }
@@ -1304,6 +1309,8 @@ struct WebBufferMapState {
 pub struct WebBuffer {
     /// The associated GPU buffer.
     pub(crate) inner: webgpu_sys::GpuBuffer,
+    /// Destroys the GPU buffer once this and every bind group using it are dropped.
+    life: Rc<deferred_destroy::BufferLife>,
     /// The mapped array buffer and mapped range.
     mapping: Rc<RefCell<WebBufferMapState>>,
     /// Unique identifier for this Buffer.
@@ -1316,6 +1323,7 @@ impl WebBuffer {
     /// Creates a new web buffer for the given Javascript object and description.
     fn new(inner: webgpu_sys::GpuBuffer, desc: &crate::BufferDescriptor<'_>) -> Self {
         Self {
+            life: deferred_destroy::BufferLife::new(&inner),
             inner,
             mapping: Rc::new(RefCell::new(WebBufferMapState {
                 mapped_buffer: None,
@@ -1372,6 +1380,10 @@ pub struct WebTexture {
     ///   this `WebTexture` is dropped, signalling that wgpu is done with the
     ///   handle.
     drop_guard: Option<Rc<DropGuard>>,
+    /// Destroys the GPU texture once this, its views and every bind group
+    /// using them are dropped. `None` for textures wgpu does not own (surface
+    /// and external textures).
+    life: Option<Rc<deferred_destroy::TextureLife>>,
     /// Unique identifier for this Texture.
     ident: crate::cmp::Identifier,
     desc: crate::TextureDescriptor<'static>,
@@ -1934,6 +1946,7 @@ impl WebDevice {
         WebTexture {
             inner: texture,
             drop_guard: Some(Rc::new(DropGuard::new(drop_callback))),
+            life: None,
             ident: crate::cmp::Identifier::create(),
             desc: crate::TextureDescriptor {
                 label: None,
@@ -2433,6 +2446,7 @@ impl dispatch::DeviceInterface for WebDevice {
 
         WebBindGroup {
             inner: bind_group,
+            _held: deferred_destroy::held_by_bind_group(desc),
             ident: crate::cmp::Identifier::create(),
         }
         .into()
@@ -2673,6 +2687,7 @@ impl dispatch::DeviceInterface for WebDevice {
 
         let texture = self.inner.create_texture(&mapped_desc).unwrap();
         WebTexture {
+            life: Some(deferred_destroy::TextureLife::new(&texture)),
             inner: texture,
             drop_guard: None,
             ident: crate::cmp::Identifier::create(),
@@ -3072,6 +3087,7 @@ impl dispatch::QueueInterface for WebQueue {
             .collect::<Vec<webgpu_sys::GpuCommandBuffer>>();
 
         self.inner.submit(&array);
+        deferred_destroy::submitted();
 
         None
     }
@@ -3209,7 +3225,8 @@ impl dispatch::BufferInterface for WebBuffer {
 }
 impl Drop for WebBuffer {
     fn drop(&mut self) {
-        // no-op
+        // The GPU buffer is destroyed by `deferred_destroy::BufferLife`'s own
+        // `Drop` impl once nothing refers to it any more.
     }
 }
 
@@ -3244,6 +3261,7 @@ impl dispatch::TextureInterface for WebTexture {
 
         WebTextureView {
             inner: view,
+            life: self.life.clone(),
             ident: crate::cmp::Identifier::create(),
         }
         .into()
@@ -3287,6 +3305,10 @@ impl Drop for WebTexture {
     fn drop(&mut self) {
         // The drop callback for external textures is fired by `DropGuard`'s
         // own `Drop` impl when the last `Rc<DropGuard>` clone is released.
+        //
+        // Textures created by wgpu are destroyed by
+        // `deferred_destroy::TextureLife`'s own `Drop` impl once nothing
+        // refers to them any more.
     }
 }
 
@@ -4697,6 +4719,7 @@ impl dispatch::SurfaceInterface for WebSurface {
             desc: desc.unwrap(),
             inner: surface_texture,
             drop_guard: None,
+            life: None,
             ident: crate::cmp::Identifier::create(),
         };
 
